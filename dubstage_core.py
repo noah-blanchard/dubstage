@@ -6,12 +6,15 @@ Video laeuft, Zeile nachsprechen, am Ende laeuft die ganze Szene
 mit der eigenen Stimme. Keine GUI hier drin.
 """
 
+import collections
 import os
 import re
 import glob
 import shutil
 import struct
 import tempfile
+import threading
+import time
 import wave
 
 import numpy as np
@@ -25,6 +28,13 @@ CACHE_DIR = os.path.join(tempfile.gettempdir(), "dubstage_cache")
 SR = 44100                 # Arbeits-Samplerate / working sample rate
 FRAME_FPS = 25             # Bilder pro Sekunde fuer die Wiedergabe
 FRAME_W = 960              # Breite der Einzelbilder - nie hochskalieren
+
+# Aufnahme-Zeitmodell / recording timing model.  Feste Groessen, keine
+# Einstellungen - der Ablauf soll auf jedem Rechner gleich klingen.
+REC_TAIL = 1.5             # Nachlauf nach dem Clip / grace period
+REC_COUNTDOWN = 3.0        # volle Sekunden 3 - 2 - 1 vor LOS
+REC_MAX_LEAD = 5.0         # laengster Vorlauf / longest context lead-in
+GO_HOLD = 0.25             # wie lange "LOS" stehen bleibt, rein optisch
 
 
 # ==========================================================================
@@ -63,6 +73,8 @@ class DubPack(object):
         self.name = os.path.basename(folder)
         self.video = None
         self.backing = None
+        self.backing_audio = None
+        self.original_audio = None     # kompletter Originalton der Szene
         self.lines = []
         self.frames = []
         self.fps = FRAME_FPS
@@ -222,8 +234,11 @@ def normalize(data, peak=0.97):
 
 
 def load_pack_audio(pack, sr=SR, progress=None):
-    """Laedt alle Original-Samples und den Backing Track."""
-    total = len(pack.lines) + 1
+    """
+    Laedt alle Original-Samples, den Backing Track und den kompletten
+    Originalton der Szene. Letzterer traegt den Vorlauf vor der Aufnahme.
+    """
+    total = len(pack.lines) + 2
     for i, line in enumerate(pack.lines):
         line.audio = read_wav_mono(line.path, sr)
         line.duration = len(line.audio) / float(sr)
@@ -231,6 +246,12 @@ def load_pack_audio(pack, sr=SR, progress=None):
             progress((i + 1) / float(total))
     pack.backing_audio = (read_wav_mono(pack.backing, sr)
                           if pack.backing else None)
+    if progress:
+        progress((len(pack.lines) + 1) / float(total))
+    try:
+        pack.original_audio = read_wav_mono(pack.video, sr)
+    except Exception:
+        pack.original_audio = None     # Vorlauf laeuft dann eben still
     pack.video_duration = pc.probe_duration(pack.video)
     if progress:
         progress(1.0)
@@ -372,7 +393,9 @@ def render_dub(pack, sr=SR, duck=0.18, log=None):
         base[:min(n, len(backing))] = backing[:n]
         have_backing = True
     else:
-        original = read_wav_mono(pack.video, sr)
+        original = getattr(pack, "original_audio", None)
+        if original is None:
+            original = read_wav_mono(pack.video, sr)
         base = np.zeros(n, dtype=np.float32)
         base[:min(n, len(original))] = original[:n]
         have_backing = False
@@ -411,6 +434,188 @@ def export_dub_video(pack, mixed_audio, out_path, sr=SR, log=None):
 
 
 # ==========================================================================
+#  Aufnahme-Zeitachse / recording timeline
+# ==========================================================================
+
+_REC_FIELDS = ("media_start", "front_pad", "lead_duration", "line_duration",
+               "tail_duration", "total_duration", "line_start", "countdown",
+               "sr", "count_samples", "go_sample", "clip_end_sample",
+               "stop_sample")
+
+
+class RecordingTimeline(collections.namedtuple("_RecTimeline", _REC_FIELDS)):
+    """
+    Eine komplette Aufnahme in Zahlen / one recording attempt as numbers.
+
+    Nullpunkt der Zeitachse ist der Beginn des Vorlaufs. LOS liegt genau
+    auf dem Clipbeginn aus DubForge. Alles andere - Bild, Ton, Schnitt -
+    leitet sich daraus ab, damit nichts mit eigener Uhr laeuft.
+    """
+
+    __slots__ = ()
+
+    @property
+    def take_samples(self):
+        """Laenge der behaltenen Aufnahme in Samples."""
+        return self.stop_sample - self.go_sample
+
+    @property
+    def take_duration(self):
+        return self.line_duration + self.tail_duration
+
+    @property
+    def go_time(self):
+        """Sekunden vom Beginn des Vorlaufs bis LOS."""
+        return self.lead_duration
+
+    def video_time(self, elapsed):
+        """
+        Bildzeitpunkt im Quellvideo zu einem Punkt der Zeitachse.
+        Waehrend der kuenstlichen Vorlaufzeit steht das frueheste Bild.
+        """
+        elapsed = float(elapsed)
+        if elapsed <= self.front_pad:
+            return self.media_start
+        return self.media_start + (elapsed - self.front_pad)
+
+    def countdown_label(self, elapsed, go_hold=GO_HOLD):
+        """
+        '3', '2', '1', 'GO' oder None - allein aus der Restzeit bis LOS.
+        Ein spaeter Zeichenaufruf springt damit zur richtigen Zahl,
+        statt eine Zahl zu verlaengern und das Stichwort zu verschieben.
+        """
+        elapsed = float(elapsed)
+        left = self.lead_duration - elapsed
+        if left > self.countdown:
+            return None
+        if left > 0.0:
+            return str(int(np.ceil(left - 1e-9)))
+        if elapsed < self.lead_duration + go_hold:
+            return "GO"
+        return None
+
+
+def recording_timeline(pack, line_index, max_lead=REC_MAX_LEAD,
+                       countdown=REC_COUNTDOWN, tail=REC_TAIL, sr=SR):
+    """
+    Rechnet den Vorlauf einer Zeile aus - ohne Geraet, ohne Uhr, ohne GUI.
+
+    Regeln: am liebsten ab dem vorigen Clip, nie mehr als fuenf Sekunden
+    davor, aber immer mindestens drei. Fehlt dem Video vorne die Zeit,
+    wird mit Standbild und Stille aufgefuellt.
+    """
+    line = pack.lines[line_index]
+    target = float(line.start)
+    prev = float(pack.lines[line_index - 1].start) if line_index > 0 else 0.0
+
+    start = min(prev, target - countdown)     # drei volle Sekunden sichern
+    start = max(start, target - max_lead)     # aber nie mehr als fuenf
+    media_start = max(0.0, start)             # nichts vor dem Videoanfang
+
+    real_lead = max(0.0, target - media_start)
+    front_pad = max(0.0, countdown - real_lead)
+    lead = real_lead + front_pad
+    line_dur = float(line.duration)
+
+    go_sample = int(round(lead * sr))
+    steps = max(0, int(round(countdown)))
+    count_samples = tuple(go_sample - int(round((countdown - i) * sr))
+                          for i in range(steps))
+    return RecordingTimeline(
+        media_start=media_start,
+        front_pad=front_pad,
+        lead_duration=lead,
+        line_duration=line_dur,
+        tail_duration=float(tail),
+        total_duration=lead + line_dur + float(tail),
+        line_start=target,
+        countdown=float(countdown),
+        sr=int(sr),
+        count_samples=count_samples,
+        go_sample=go_sample,
+        clip_end_sample=go_sample + int(round(line_dur * sr)),
+        stop_sample=go_sample + int(round((line_dur + float(tail)) * sr)))
+
+
+def build_monitor_audio(pack, timeline, sr=SR):
+    """
+    Der Ton, den der Spieler waehrend eines Versuchs hoert - ein einziger
+    Puffer, damit der Wechsel bei LOS keine Luecke bekommt.
+
+    Vorne Stille fuer die kuenstliche Vorlaufzeit, dann der echte
+    Szenenton mit allen vorangehenden Repliken, ab LOS nur noch der
+    Backing Track. Ohne Backing Track bleibt es ab LOS still.
+    """
+    tl = timeline
+    n = int(tl.stop_sample)
+    out = np.zeros(n, dtype=np.float32)
+
+    pad = int(round(tl.front_pad * sr))
+    real = max(0, int(tl.go_sample) - pad)
+    original = getattr(pack, "original_audio", None)
+    if real > 0 and original is not None:
+        seg = slice_audio(original, tl.media_start, real / float(sr), sr)
+        out[pad:pad + real] = fit_len(seg, real)
+
+    backing = getattr(pack, "backing_audio", None)
+    if backing is not None and n > tl.go_sample:
+        m = n - int(tl.go_sample)
+        seg = slice_audio(backing, tl.line_start, m / float(sr), sr)
+        out[tl.go_sample:] = fit_len(seg, m)
+    return out
+
+
+def blit(out, data, offset):
+    """
+    Schreibt data an die Stelle offset in out - auch teilweise davor
+    oder dahinter. Gibt zurueck, bis wohin geschrieben wurde.
+    """
+    data = np.asarray(data, dtype=np.float32)
+    n = len(out)
+    a = int(offset)
+    if a >= n or a + len(data) <= 0:
+        return 0
+    src = max(0, -a)
+    dst = max(0, a)
+    m = min(len(data) - src, n - dst)
+    if m <= 0:
+        return 0
+    out[dst:dst + m] = data[src:src + m]
+    return dst + m
+
+
+def place_chunks(chunks, go_time, n_samples, sr=SR):
+    """
+    Schneidet aus zeitgestempelten Eingabebloecken genau das Fenster ab
+    LOS heraus. chunks: (Startzeit, Daten). Reine Rechnung, damit sich
+    der Schnitt ohne Geraet pruefen laesst.
+
+    Ein Block, der ueber LOS hinweggeht, wird in sich geteilt. Fehlende
+    Samples bleiben Null - spaeteres Material rutscht nie nach vorn.
+    """
+    n = max(0, int(n_samples))
+    out = np.zeros(n, dtype=np.float32)
+    for start, data in chunks:
+        blit(out, data, int(round((float(start) - float(go_time)) * sr)))
+    return out
+
+
+def timestamps_usable(chunks, sr, tol=0.25):
+    """
+    Laufen die ADC-Zeitstempel wirklich mit den Samples mit?
+    Manche Backends liefern nur Nullen - dann taugen sie nicht als Uhr.
+    """
+    marks = [(float(t), int(i)) for (t, i, _d) in chunks if t]
+    if len(marks) < 2:
+        return False
+    (t0, i0), (t1, i1) = marks[0], marks[-1]
+    if t1 <= t0 or i1 <= i0:
+        return False
+    want = (i1 - i0) / float(sr)
+    return abs((t1 - t0) - want) <= max(0.02, want * tol)
+
+
+# ==========================================================================
 #  Mikrofon / microphone
 # ==========================================================================
 
@@ -426,6 +631,368 @@ def audio_backend():
 ENV_MS = 20          # Aufloesung der laufenden Huellkurve / live envelope
 
 
+READY_CHUNKS = 2      # so viele Rueckrufe muessen vor dem Vorlauf da sein
+READY_TIMEOUT = 1.5   # laenger warten wir nicht auf das Geraet
+CAPTURE_GRACE = 0.6   # Wartezeit, bis der Eingang das Fenster nachgeliefert hat
+
+
+def _stamp(time_info, name):
+    """Zeitstempel aus dem PortAudio-Rueckruf, 0.0 wenn es keinen gibt."""
+    try:
+        return float(getattr(time_info, name))
+    except Exception:
+        return 0.0
+
+
+class RecordingSession(object):
+    """
+    Ein Aufnahmeversuch mit Zeitstempeln / one timestamped attempt.
+
+    Das Mikrofon laeuft schon, bevor ueberhaupt etwas zu hoeren ist. Der
+    Schnitt am Ende richtet sich nach den ADC-Zeitstempeln von PortAudio -
+    nicht danach, wann ein Rueckruf im Programm ankommt. Genau das ist der
+    Unterschied, der die erste Silbe rettet.
+    """
+
+    def __init__(self, sd, timeline, monitor, sr=SR, device=None,
+                 blocksize=0, env_ms=ENV_MS, log=None):
+        self.sd = sd
+        self.tl = timeline
+        self.sr = int(sr)
+        self.monitor = np.asarray(monitor, dtype=np.float32)
+        self.device = device
+        self.blocksize = int(blocksize)
+        self.log = log
+        self.duplex = False
+        self.fallback = False          # ohne brauchbare ADC-Zeitstempel
+
+        self._lock = threading.Lock()
+        self._chunks = []              # (adc_time, frame_index, data)
+        self._frames_in = 0
+        self._arm_frame = None
+        self._armed = False
+        self._dac0 = None              # Streamzeit des ersten Monitor-Samples
+        self._dac_lead = 0.0           # Vorlauf der Ausgabe vor dem Hoeren
+        self._in_lat = 0.0             # Verzug des Eingangs
+        self._wall0 = None
+        self._out_pos = 0
+        self._spent = False            # Monitor komplett ausgegeben
+        self._closed = False
+
+        self._stream = None            # Vollduplex oder Eingang
+        self._out_stream = None
+        self._clock = None             # Stream, dessen Uhr wir lesen
+
+        self._env_step = max(1, int(self.sr * env_ms / 1000.0))
+        self._env = []
+        self._live = np.zeros(max(0, int(timeline.take_samples)),
+                              dtype=np.float32)
+        self._live_end = 0
+
+    # ------------------------------------------------------------ Rueckrufe
+    def _read_in(self, indata, frames, time_info):
+        data = np.array(indata[:, 0], dtype=np.float32)
+        adc = _stamp(time_info, "inputBufferAdcTime")
+        with self._lock:
+            idx = self._frames_in
+            self._frames_in += int(frames)
+            self._chunks.append((adc, idx, data))
+            if self._armed and self._dac0 is not None:
+                self._place_live(adc, idx, data)
+
+    def _write_out(self, outdata, frames, time_info):
+        outdata[:] = 0.0
+        if not self._armed:
+            return
+        if self._dac0 is None:
+            # Erster hoerbarer Block: hier beginnt die Zeitachse.
+            self._dac0 = _stamp(time_info, "outputBufferDacTime")
+            now = _stamp(time_info, "currentTime")
+            self._dac_lead = (self._dac0 - now) if now else self._latency(1)
+            with self._lock:
+                self._arm_frame = self._frames_in
+        a = self._out_pos
+        b = min(len(self.monitor), a + int(frames))
+        if b > a:
+            outdata[:b - a, 0] = self.monitor[a:b]
+        self._out_pos = a + int(frames)
+        if self._out_pos >= len(self.monitor):
+            self._spent = True
+
+    def _on_duplex(self, indata, outdata, frames, time_info, status):
+        # Ausgang zuerst: dann steht die Zeitachse, bevor der Eingang
+        # desselben Blocks einsortiert wird.
+        self._write_out(outdata, frames, time_info)
+        self._read_in(indata, frames, time_info)
+
+    def _on_input(self, indata, frames, time_info, status):
+        self._read_in(indata, frames, time_info)
+
+    def _on_output(self, outdata, frames, time_info, status):
+        self._write_out(outdata, frames, time_info)
+
+    # ------------------------------------------------------------ Aufbau
+    def open(self):
+        """Oeffnet das Mikrofon. Der Ausgang bleibt bis arm() stumm."""
+        if self.sd is None:
+            raise RuntimeError("sounddevice fehlt / missing")
+        try:
+            self._stream = self.sd.Stream(
+                samplerate=self.sr, channels=(1, 1), dtype="float32",
+                blocksize=self.blocksize, device=(self.device, None),
+                callback=self._on_duplex)
+            self._stream.start()
+            self.duplex = True
+        except Exception:
+            # Manche Geraetepaare koennen kein Vollduplex - dann zwei
+            # Stroeme, der Eingang trotzdem zuerst und durchgehend.
+            if self._stream is not None:
+                try:
+                    self._stream.close()
+                except Exception:
+                    pass
+            self._stream = None
+            kwargs = {"samplerate": self.sr, "channels": 1,
+                      "dtype": "float32", "blocksize": self.blocksize,
+                      "callback": self._on_input}
+            if self.device is not None:
+                kwargs["device"] = self.device
+            self._stream = self.sd.InputStream(**kwargs)
+            self._stream.start()
+            self.duplex = False
+        self._clock = self._stream
+        return self
+
+    def ready(self):
+        """Sind genug Eingaberueckrufe da, um loszulegen?"""
+        with self._lock:
+            return len(self._chunks) >= READY_CHUNKS
+
+    def wait_ready(self, timeout=READY_TIMEOUT, step=0.005):
+        """Wartet begrenzt auf das Geraet. True, wenn es rechtzeitig kam."""
+        end = time.perf_counter() + float(timeout)
+        while time.perf_counter() < end:
+            if self.ready():
+                return True
+            time.sleep(step)
+        return self.ready()
+
+    def arm(self):
+        """
+        Startet die Zeitachse: ab jetzt laeuft der Monitorton, und der
+        erste ausgegebene Block legt den Nullpunkt fest.
+        """
+        if self._armed:
+            return
+        # Die Latenz jetzt merken - beim Schnitt sind die Stroeme zu.
+        self._in_lat = self._latency(0)
+        with self._lock:
+            self.fallback = not timestamps_usable(self._chunks, self.sr)
+            self._wall0 = time.perf_counter()
+        if self.fallback:
+            self._note("DubStage: ADC-Zeitstempel unbrauchbar - "
+                       "Rueckfall auf Samplezaehler / falling back to "
+                       "the input sample counter.")
+        if not self.duplex:
+            self._out_stream = self.sd.OutputStream(
+                samplerate=self.sr, channels=1, dtype="float32",
+                blocksize=self.blocksize, callback=self._on_output)
+            self._armed = True
+            self._out_stream.start()
+            self._clock = self._out_stream
+        else:
+            self._armed = True
+
+    # ------------------------------------------------------------ Ablauf
+    def started(self):
+        """Laeuft der hoerbare Teil schon?"""
+        return self._armed and self._dac0 is not None
+
+    def position(self):
+        """
+        Sekunden seit Beginn des Vorlaufs, gemessen an der Streamuhr.
+        Das ist die Stelle, die der Spieler gerade hoert - danach richten
+        sich Bild und Countdown.
+        """
+        if not self.started():
+            return 0.0
+        now = self._stream_time()
+        if now is None:
+            return max(0.0, time.perf_counter() - (self._wall0 or 0.0))
+        return max(0.0, now - self._dac0)
+
+    def _stream_time(self):
+        try:
+            return float(self._clock.time)
+        except Exception:
+            return None
+
+    def go_time(self):
+        """Zeitpunkt von LOS in derselben Uhr wie die Eingabestempel."""
+        if self._dac0 is None:
+            return None
+        return self._dac0 + self.tl.lead_duration
+
+    def _latency(self, which):
+        """Ein- oder Ausgabelatenz des Geraets, 0.0 wenn unbekannt."""
+        stream = self._out_stream if which and self._out_stream else self._stream
+        try:
+            lat = stream.latency
+        except Exception:
+            return 0.0
+        try:
+            return float(lat[which])
+        except Exception:
+            try:
+                return float(lat)
+            except Exception:
+                return 0.0
+
+    def go_frame(self):
+        """
+        Samplenummer von LOS im Eingabestrom - fuer den Rueckfall ohne
+        Zeitstempel. Die Latenz beider Richtungen zaehlt mit: der Ausgang
+        laeuft der Uhr voraus, der Eingang hinterher.
+        """
+        if self._arm_frame is None:
+            return None
+        delay = self.tl.lead_duration + self._dac_lead + self._in_lat
+        return self._arm_frame + int(round(delay * self.sr))
+
+    def captured_enough(self):
+        """Liegt das behaltene Fenster vollstaendig als Eingabe vor?"""
+        go = self.go_time()
+        if go is None:
+            return False
+        with self._lock:
+            if self.fallback:
+                go_f = self.go_frame()
+                return (go_f is not None
+                        and self._frames_in >= go_f + self.tl.take_samples)
+            if not self._chunks:
+                return False
+            stamp, _idx, data = self._chunks[-1]
+            end = stamp + len(data) / float(self.sr)
+        return end >= go + self.tl.take_duration
+
+    def finished(self):
+        """
+        Ist der Versuch durch? Der Ton laeuft der Aufnahme um die Latenz
+        voraus - deshalb zaehlt nicht nur die Position, sondern auch, ob
+        der Eingang das Fenster schon ganz geliefert hat.
+        """
+        if self._closed:
+            return True
+        if not self.started():
+            return False
+        pos = self.position()
+        if pos < self.tl.total_duration:
+            return False
+        return (self.captured_enough()
+                or pos >= self.tl.total_duration + CAPTURE_GRACE)
+
+    # ------------------------------------------------------------ Anzeige
+    def _place_live(self, adc, idx, data):
+        """Schreibt einen Block ins behaltene Fenster - nur ab LOS."""
+        off = self._offset_of(adc, idx)
+        if off is None:
+            return
+        end = blit(self._live, data, off)
+        if end > self._live_end:
+            self._live_end = end
+
+    def _offset_of(self, adc, idx):
+        if self.fallback:
+            go_f = self.go_frame()
+            return None if go_f is None else int(idx) - go_f
+        go_t = self.go_time()
+        return None if go_t is None else int(round((adc - go_t) * self.sr))
+
+    def envelope(self):
+        """
+        Huellkurve des behaltenen Fensters. Beginnt bei LOS - was waehrend
+        des Countdowns ins Mikrofon faellt, taucht hier nie auf.
+        """
+        with self._lock:
+            step = self._env_step
+            k = self._live_end // step
+            have = len(self._env)
+            if k > have:
+                block = self._live[have * step:k * step].reshape(k - have,
+                                                                 step)
+                self._env.extend(np.abs(block).max(axis=1).tolist())
+            return list(self._env), step / float(self.sr)
+
+    def level(self):
+        if not self._env:
+            return 0.0
+        return float(min(1.0, max(self._env[-5:]) * 1.4))
+
+    # ------------------------------------------------------------ Abschluss
+    def complete(self):
+        """
+        Schliesst die Stroeme und liefert genau das Fenster von LOS bis
+        Clipende plus Nachlauf - immer dieselbe Laenge.
+        """
+        go = self.go_time()
+        frames = int(self.tl.take_samples)
+        self.close()
+        with self._lock:
+            chunks = list(self._chunks)
+        if go is None:
+            return np.zeros(frames, dtype=np.float32)
+        if not self.fallback and not self._covers(chunks, go, frames):
+            # Zeitstempel sahen brauchbar aus, treffen das Fenster aber
+            # nicht - dann doch ueber den Samplezaehler schneiden.
+            self._note("DubStage: ADC-Zeitstempel treffen das Fenster "
+                       "nicht - Rueckfall auf Samplezaehler.")
+            self.fallback = True
+        if self.fallback:
+            go_f = self.go_frame()
+            if go_f is None:
+                return np.zeros(frames, dtype=np.float32)
+            pairs = [(go + (idx - go_f) / float(self.sr), data)
+                     for (_t, idx, data) in chunks]
+        else:
+            pairs = [(t, data) for (t, _i, data) in chunks]
+        return place_chunks(pairs, go, frames, self.sr)
+
+    def _covers(self, chunks, go, frames):
+        span = frames / float(self.sr)
+        for (t, _i, data) in chunks:
+            if t and t < go + span and t + len(data) / float(self.sr) > go:
+                return True
+        return False
+
+    def cancel(self):
+        """Versuch verwerfen / discard the attempt."""
+        self.close()
+
+    def close(self):
+        if self._closed:
+            return
+        self._closed = True
+        for stream in (self._out_stream, self._stream):
+            if stream is None:
+                continue
+            for step in (stream.stop, stream.close):
+                try:
+                    step()
+                except Exception:
+                    pass
+        self._out_stream = None
+        self._stream = None
+
+    def _note(self, text):
+        if self.log:
+            try:
+                self.log(text)
+                return
+            except Exception:
+                pass
+        print(text)
+
+
 class Mic(object):
     """Aufnahme, optional mit gleichzeitiger Wiedergabe des Backing Tracks."""
 
@@ -437,6 +1004,7 @@ class Mic(object):
         self._env = []                                  # Spitzenwerte je Fenster
         self._env_step = max(1, int(sr * ENV_MS / 1000.0))
         self._buf = np.zeros(0, dtype=np.float32)
+        self.session = None            # laufender Aufnahmeversuch
 
     @property
     def available(self):
@@ -504,12 +1072,47 @@ class Mic(object):
             return np.zeros(0, dtype=np.float32)
         return np.concatenate(self._chunks).astype(np.float32)
 
+    # -------------------------------------------------- Aufnahmeversuch
+    def open_session(self, timeline, monitor, device=None, log=None):
+        """
+        Oeffnet Mikrofon und Monitorton fuer einen Versuch. Der Eingang
+        laeuft ab hier durchgehend - bei LOS wird nichts mehr gestartet.
+        """
+        if not self.sd:
+            raise RuntimeError("sounddevice fehlt / missing")
+        self.cancel_session()
+        session = RecordingSession(self.sd, timeline, monitor, sr=self.sr,
+                                   device=device, log=log)
+        session.open()
+        self.session = session
+        return session
+
+    def finish_session(self):
+        """Beendet den Versuch und liefert das behaltene Fenster."""
+        session, self.session = self.session, None
+        if session is None:
+            return None
+        return session.complete()
+
+    def cancel_session(self):
+        """Bricht einen laufenden Versuch ab und verwirft ihn."""
+        session, self.session = self.session, None
+        if session is not None:
+            try:
+                session.cancel()
+            except Exception:
+                pass
+
     def envelope(self):
         """Bisher aufgenommene Huellkurve und ihre Schrittweite in Sekunden."""
+        if self.session is not None:
+            return self.session.envelope()
         return list(self._env), self._env_step / float(self.sr)
 
     def level(self):
         """Aktueller Pegel 0..1 fuer die Aussteuerungsanzeige."""
+        if self.session is not None:
+            return self.session.level()
         if not self._env:
             return 0.0
         return float(min(1.0, max(self._env[-5:]) * 1.4))

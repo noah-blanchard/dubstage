@@ -80,7 +80,7 @@ The start time sits in the file name (`44-048` = 44.048 s), so a pack stays read
 
 ## How it works
 
-Video is never decoded during playback. Each pack is split into JPEG frames once (25 fps at 960 px, cached in `%TEMP%`), which keeps playback smooth and independent of codecs. Audio runs through `sounddevice`; recording and the backing track play simultaneously, and the microphone writes a running envelope so the comparison strip can be drawn live.
+Video is never decoded during playback. Each pack is split into JPEG frames once (25 fps at 960 px, cached in `%TEMP%`), which keeps playback smooth and independent of codecs. Audio runs through `sounddevice`. A recording is one timeline on one clock: the microphone is opened before anything becomes audible, the run-up, countdown, line and 1.5-second grace period all play from a single monitor buffer, and the take is cut out of the timestamped input exactly at the clip boundary — so the start of the device never lands on the cue. The microphone writes a running envelope so the comparison strip can be drawn live.
 
 Clips are loudness-normalised to −1 dBFS peak. The comparison normalises both curves to their own level, so what you judge is rhythm rather than volume.
 

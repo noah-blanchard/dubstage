@@ -108,7 +108,7 @@ Pick a pack → **Start**. Per line:
 | Button | What happens |
 |---|---|
 | **▶ Original** | The video segment plays with the original line |
-| **● Record** | 3-2-1, then the same segment runs and you speak over it |
+| **● Record** | The scene runs into the line, 3-2-1 over the moving picture, and on **GO** you speak |
 | **▶ My take** | Play your take back, against the video |
 | **Leave line empty** | Discard the take, the line keeps the original |
 | **‹ Back / Next ›** | Change line |
@@ -117,13 +117,39 @@ Below the video the line's **subtitle** is shown in large type. The strip above 
 
 After the last line **Done** leads to the finale: the whole scene plays with your voice, subtitles running along. **Save as video** writes an MP4 into the `dubs` folder. **‹ Back to the lines** returns any time.
 
-Keyboard: **Space** records or starts the finale, **Esc** goes back.
+Keyboard: **Space** records or starts the finale, **Esc** goes back — during a
+recording it discards the attempt.
+
+## How a recording runs
+
+**Record** does not start on the spot. First the microphone is opened, and only
+once it is really running does anything become audible — that way the start of
+the device can never eat your first syllable.
+
+Then the scene plays into the line: up to five seconds of run-up, from the
+previous clip where possible, with the original sound and any dialogue before
+your line. Over the moving picture the numbers **3**, **2** and **1** appear, one
+real second each. **GO** falls exactly on the clip boundary DubForge cut — no
+pause, no frozen frame, the scene simply carries on.
+
+From GO the original dialogue is gone: only the backing track keeps running, so
+the line is yours. Recording continues to 1.5 seconds past the end of the clip —
+room to finish the sentence. Then it is over and DubStage waits. Nothing plays
+back on its own.
+
+The microphone is already listening during the run-up, but that is only a
+synchronisation buffer: what falls into it before GO is discarded automatically.
+Your take starts at GO, to the sample, and always lasts exactly the length of the
+line plus 1.5 seconds.
+
+If the video has less than three seconds before the line, DubStage pads the front
+with the earliest frame and silence, so the countdown stays a full three seconds.
 
 ## The comparison strip
 
 Above the button row sits the actual tool: the **original track as a blue silhouette**, with **your take** laid over it semi-transparently — red and growing live while recording, green afterwards. A gold marker shows where you are.
 
-Both curves share the same time axis, starting at zero of the clip. So you can see at a glance whether you come in too early or too late and whether your pauses line up: if the blocks sit on top of each other, the timing matches. The strip is slightly wider than the original because recording continues for 0.7 seconds after the clip — room to finish the sentence.
+Both curves share the same time axis, starting at zero of the clip. So you can see at a glance whether you come in too early or too late and whether your pauses line up: if the blocks sit on top of each other, the timing matches. The strip is slightly wider than the original because recording continues for 1.5 seconds after the clip — room to finish the sentence.
 
 Each curve is normalised to its own loudness, so what you compare is rhythm, not level. If your take is too quiet, a note appears at the bottom right.
 

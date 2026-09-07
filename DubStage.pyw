@@ -56,7 +56,7 @@ BAN_TXT = "#241f47"
 WAVE_ORIG = "#3c4470"          # Silhouette des Originals
 WAVE_ORIG_TXT = "#7079ad"
 
-TAIL = 0.7            # Nachlauf der Aufnahme / recording tail in seconds
+TAIL = ds.REC_TAIL    # Nachlauf der Aufnahme / recording tail in seconds
 
 
 # ==========================================================================
@@ -115,6 +115,7 @@ T = {
     "finish":     ("Fertig", "Done"),
     "recording":  ("AUFNAHME", "RECORDING"),
     "go":         ("LOS", "GO"),
+    "prep":       ("Mikrofon wird bereit ...", "Getting the microphone ready ..."),
     "hint":       ("Original anhoeren, dann aufnehmen. Beliebig oft.",
                    "Listen to the original, then record. As often as you like."),
     "no_take":    ("noch nichts aufgenommen", "nothing recorded yet"),
@@ -293,7 +294,7 @@ class Game(tk.Tk):
         self.line_i = 0
         self.mix = None
         self.screen = "menu"
-        self.phase = "idle"           # idle | listen | record | play
+        self.phase = "idle"           # idle | listen | record
         self._phase_deadline = None
         self.sel_pack = 0
         self.menu_scroll = 0
@@ -306,6 +307,10 @@ class Game(tk.Tk):
         self._play = None             # laufende Wiedergabe / running playback
         self._rec_guard = None
         self._rec_done = True
+        self._rec_session = None       # laufender Aufnahmeversuch
+        self._rec_tl = None            # dessen Zeitachse
+        self._rec_stage = "idle"        # prep | lead | take | tail
+        self._rec_ready_end = 0.0
         self._resize_job = None
         self._embedded = []
         self.buttons = []
@@ -456,7 +461,10 @@ class Game(tk.Tk):
 
     def _on_escape(self):
         if self.screen == "stage":
-            self.leave_round()
+            if self.phase != "idle":
+                self._force_idle()      # laufenden Versuch verwerfen
+            else:
+                self.leave_round()
         elif self.screen == "finale":
             self.show_menu()
 
@@ -1259,8 +1267,6 @@ class Game(tk.Tk):
         try:
             self._show_index(ds.frame_at(self.pack, job["start"] + elapsed))
             if self.screen == "stage":
-                if self.phase == "record":
-                    self._draw_strip_take(live=True)
                 self._strip_head(elapsed)
         except Exception:
             traceback.print_exc()      # darf die Schleife nicht abbrechen
@@ -1272,10 +1278,11 @@ class Game(tk.Tk):
 
     def _stop_audio(self):
         self._play = None
-        try:
-            self.mic.stop_play()
-        except Exception:
-            pass
+        for step in (self.mic.cancel_session, self.mic.stop_play):
+            try:
+                step()
+            except Exception:
+                pass
 
     # ------------------------------------------------ Phasen mit Notausgang
     def _set_phase(self, name, expected=0.0):
@@ -1299,11 +1306,14 @@ class Game(tk.Tk):
             except Exception:
                 pass
             self._rec_guard = None
-        for fn in (self.mic.stop, self.mic.stop_play):
+        for fn in (self.mic.cancel_session, self.mic.stop, self.mic.stop_play):
             try:
                 fn()
             except Exception:
                 pass
+        self._rec_session = None
+        self._rec_tl = None
+        self._rec_stage = "idle"
         self.phase = "idle"
         try:
             if self.screen == "stage":
@@ -1359,63 +1369,104 @@ class Game(tk.Tk):
         self._stop_audio()
         self.sync()
 
+    # ---------------------------------------------------- Aufnahmeversuch
     def do_record(self):
+        """
+        Ein Versuch am Stueck: Mikrofon oeffnen, Szene als Vorlauf hoeren,
+        Countdown, LOS auf dem Clipbeginn, Zeile, Nachlauf. Eine einzige
+        Zeitachse - und die Uhr dafuer gibt der Ton vor, nicht Tk.
+        """
         line = self.current_line()
         if line is None or self.phase != "idle":
             return
-        self._set_phase("countdown", 3.0)
-        self.sync()
-        self._count = 3
-        self._countdown()
-
-    def _countdown(self):
-        if self.phase != "countdown":
-            return
-        # Erst zeichnen (darf scheitern), dann auf jeden Fall weiterschalten.
+        tl = ds.recording_timeline(self.pack, self.line_i)
         try:
-            line = self.current_line()
-            if line is not None:
-                self.show_frame(line.start)
-            if self._count > 0:
-                self._overlay(str(self._count), GOLD, 76)
-            else:
-                self._overlay(t("go"), TEAL, 60)
-        except Exception:
-            traceback.print_exc()
-        if self._count > 0:
-            self._count -= 1
-            self.after(650, self._countdown)
-        else:
-            self.after(300, self._begin_record)
-
-    def _begin_record(self):
-        if self.phase != "countdown":
-            return
-        line = self.current_line()
-        dur = line.duration + TAIL
-        playback = None
-        if getattr(self.pack, "backing_audio", None) is not None:
-            playback = ds.slice_audio(self.pack.backing_audio, line.start, dur)
-        try:
-            self.mic.start(playback=playback, device=self._mic_device())
+            monitor = ds.build_monitor_audio(self.pack, tl)
+            session = self.mic.open_session(tl, monitor,
+                                            device=self._mic_device())
         except Exception as ex:
+            traceback.print_exc()
             self._force_idle()
             messagebox.showerror(t("err"), str(ex))
             return
-        self._set_phase("record", dur)
+        self._rec_tl = tl
+        self._rec_session = session
         self._rec_done = False
+        self._rec_stage = "prep"
+        # Notbremse deckt Bereitschaft, Vorlauf, Zeile, Nachlauf und das
+        # Nachliefern des Eingangs ab.
+        span = ds.READY_TIMEOUT + tl.total_duration + ds.CAPTURE_GRACE
+        self._set_phase("record", span)
+        self._rec_guard = self.after(int(span * 1000) + 800,
+                                     self._finish_record)
+        self.sync()
         try:
-            self._overlay(t("recording"), RED, 34)
-            self.sync()
+            self._overlay(t("prep"), DIM, 26)
+            self.show_frame(tl.video_time(0.0))
         except Exception:
             traceback.print_exc()
-        self._play_from(line.start, dur, self._finish_record)
-        # Sicherheitsnetz: beendet die Aufnahme auch, wenn die Bildschleife
-        # aus irgendeinem Grund nicht bis zum Ende kommt.
-        self._rec_guard = self.after(int(dur * 1000) + 500,
-                                     self._finish_record)
+        self._rec_ready_end = time.perf_counter() + ds.READY_TIMEOUT
+        self._wait_ready()
+
+    def _wait_ready(self):
+        """
+        Erst wenn das Mikrofon Rueckrufe liefert, wird ueberhaupt etwas
+        hoerbar. Damit haengt der Geraetestart nicht mehr an LOS.
+        """
+        session = self._rec_session
+        if session is None or self.phase != "record":
+            return
+        if not session.ready() and time.perf_counter() < self._rec_ready_end:
+            self.after(5, self._wait_ready)
+            return
+        try:
+            session.arm()
+        except Exception as ex:
+            traceback.print_exc()
+            self._force_idle()          # vorige Aufnahme bleibt erhalten
+            messagebox.showerror(t("err"), str(ex))
+            return
+        self._rec_stage = "lead"
+        self._attempt_tick()
+
+    def _attempt_tick(self):
+        """
+        Bild, Countdown und Streifen folgen der Streamuhr. Ein spaeter
+        Aufruf springt zur richtigen Stelle, statt eine Zahl zu
+        verlaengern - das Stichwort bleibt, wo es hingehoert.
+        """
+        session, tl = self._rec_session, self._rec_tl
+        if session is None or tl is None or self.phase != "record":
+            return
+        pos = session.position()
+        if session.finished():
+            self._finish_record()
+            return
+        try:
+            self.show_frame(tl.video_time(pos))
+            label = tl.countdown_label(pos)
+            if label is None:
+                self._overlay(None)
+            elif label == "GO":
+                self._overlay(t("go"), TEAL, 60)
+            else:
+                self._overlay(label, GOLD, 76)
+            since_go = pos - tl.lead_duration
+            if since_go >= 0.0:
+                self._rec_stage = ("tail" if since_go >= tl.line_duration
+                                   else "take")
+                self._draw_strip_take(live=True)
+            self._strip_head(max(0.0, since_go))
+        except Exception:
+            traceback.print_exc()      # darf die Schleife nicht abbrechen
+        self.after(max(1, int(1000.0 / max(1.0, float(self.pack.fps)))),
+                   self._attempt_tick)
 
     def _finish_record(self):
+        """
+        Schneidet das Fenster von LOS bis Clipende plus Nachlauf heraus.
+        Was waehrend des Countdowns ins Mikrofon fiel, faellt weg.
+        """
         if self._rec_done:
             return
         self._rec_done = True
@@ -1425,19 +1476,24 @@ class Game(tk.Tk):
             except Exception:
                 pass
             self._rec_guard = None
+        session = self._rec_session
+        started = session is not None and session.started()
+        take = None
         try:
-            data = self.mic.stop()
+            take = self.mic.finish_session()
         except Exception:
             traceback.print_exc()
-            data = None
         line = self.current_line()
-        if line is not None and data is not None and len(data):
-            line.take = data
+        if line is not None and started and take is not None and len(take):
+            line.take = take
+        self._rec_session = None
+        self._rec_tl = None
+        self._rec_stage = "idle"
         self._play = None
         self._set_phase("idle")
         try:
             self._overlay(None)
-            self.sync()
+            self.sync()               # zurueck zur Zeile, kein Nachspielen
         except Exception:
             traceback.print_exc()
 

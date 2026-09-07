@@ -107,7 +107,7 @@ Pack auswählen → **Loslegen**. Pro Zeile:
 | Knopf | Was passiert |
 |---|---|
 | **▶ Original** | Das Videostück läuft mit der Originalzeile |
-| **● Aufnehmen** | 3-2-1, dann läuft dasselbe Stück und du sprichst drüber |
+| **● Aufnehmen** | Die Szene läuft in die Zeile hinein, 3-2-1 über dem laufenden Bild, auf **LOS** sprichst du |
 | **▶ Meine Aufnahme** | Deine Aufnahme direkt anhören, zum Video |
 | **Zeile leer lassen** | Aufnahme verwerfen, die Zeile behält das Original |
 | **‹ Zurück / Weiter ›** | Zeile wechseln |
@@ -116,13 +116,40 @@ Unter dem Video steht groß der **Untertitel** der Zeile. Die Leiste darüber ze
 
 Nach der letzten Zeile führt **Fertig** ins Finale: die ganze Szene läuft mit deiner Stimme, der Untertitel läuft mit. **Als Video speichern** legt eine MP4 im Ordner `dubs` ab. **‹ Zurück zu den Zeilen** geht jederzeit wieder rein.
 
-Tastatur: **Leertaste** nimmt auf bzw. startet das Finale, **Esc** geht zurück.
+Tastatur: **Leertaste** nimmt auf bzw. startet das Finale, **Esc** geht zurück —
+während einer Aufnahme verwirft es den Versuch.
+
+## Wie eine Aufnahme abläuft
+
+**Aufnehmen** legt nicht sofort los. Zuerst wird das Mikrofon geöffnet, und erst
+wenn es wirklich läuft, wird überhaupt etwas hörbar — so kann der Gerätestart
+niemals die erste Silbe wegfressen.
+
+Dann läuft die Szene in die Zeile hinein: bis zu fünf Sekunden Vorlauf, wenn
+möglich ab dem vorigen Clip, mit dem Originalton samt der Repliken davor. Über
+dem laufenden Bild erscheinen **3**, **2** und **1**, jede eine echte Sekunde
+lang. **LOS** liegt genau auf dem Clipbeginn, den DubForge geschnitten hat —
+keine Pause, kein eingefrorenes Bild, die Szene läuft einfach weiter.
+
+Ab LOS ist der Originalton der Figur weg: nur der Backing Track läuft weiter,
+die Zeile gehört dir. Aufgenommen wird bis 1,5 Sekunden nach dem Ende des Clips —
+Platz, um den Satz zu Ende zu sprechen. Danach ist Schluss, und DubStage wartet.
+Es spielt nichts von allein nach.
+
+Das Mikrofon hört schon im Vorlauf mit, aber das ist nur ein Puffer zum
+Gleichziehen: Was vor LOS hineinfällt, wird automatisch verworfen. Deine
+Aufnahme beginnt samplegenau bei LOS und dauert immer genau die Länge der Zeile
+plus 1,5 Sekunden.
+
+Hat das Video vor der Zeile weniger als drei Sekunden, füllt DubStage vorne mit
+dem frühesten Bild und Stille auf, damit der Countdown volle drei Sekunden
+bleibt.
 
 ## Der Vergleichsstreifen
 
 Über der Knopfreihe liegt das eigentliche Werkzeug: die **Originalspur als blaue Silhouette**, darüber halbtransparent **deine Aufnahme** — beim Aufnehmen rot und live mitwachsend, danach grün. Eine goldene Marke zeigt, wo du gerade bist.
 
-Beide Kurven teilen sich dieselbe Zeitachse, die bei Null des Clips beginnt. Damit siehst du auf einen Blick, ob du zu früh oder zu spät einsetzt und ob deine Pausen sitzen: liegen die Blöcke übereinander, passt das Timing. Der Streifen ist etwas breiter als das Original, weil nach dem Clip noch 0,7 Sekunden weiter aufgenommen wird — Platz, um den Satz zu Ende zu sprechen.
+Beide Kurven teilen sich dieselbe Zeitachse, die bei Null des Clips beginnt. Damit siehst du auf einen Blick, ob du zu früh oder zu spät einsetzt und ob deine Pausen sitzen: liegen die Blöcke übereinander, passt das Timing. Der Streifen ist etwas breiter als das Original, weil nach dem Clip noch 1,5 Sekunden weiter aufgenommen wird — Platz, um den Satz zu Ende zu sprechen.
 
 Beide Kurven werden auf ihre eigene Lautstärke normiert, verglichen wird also Rhythmus und nicht Pegel. Ist deine Aufnahme zu leise, steht das als Hinweis rechts unten.
 
